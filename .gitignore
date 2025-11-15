@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
-data/
+#data/
 datasets/
 *.tar
 *.tar.gz

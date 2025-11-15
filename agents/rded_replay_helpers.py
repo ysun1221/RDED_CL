@@ -12,7 +12,12 @@ from cl_utils.rded_adapter import RDEDDistiller
 # convert mammoth buffer to tensor dataset
 def _buffer_as_dataset(buf: Buffer) -> TensorDataset:
 
-    for xs_name, ys_name in [("x", "y"), ("xs", "ys"), ("data_x", "data_y")]:
+    for xs_name, ys_name in [
+        ("x", "y"),
+        ("xs", "ys"),
+        ("data_x", "data_y"),
+        ("examples", "labels"),  # mammoth Buffer fields
+    ]:
         if hasattr(buf, xs_name) and hasattr(buf, ys_name):
             xs = getattr(buf, xs_name)
             ys = getattr(buf, ys_name)
@@ -31,6 +36,14 @@ def _buffer_as_dataset(buf: Buffer) -> TensorDataset:
     if hasattr(buf, "get_all") and callable(buf.get_all):
         X, Y = buf.get_all()
         return TensorDataset(X.detach().cpu(), Y.detach().cpu())
+
+    get_all_data = getattr(buf, "get_all_data", None)
+    if callable(get_all_data):
+        data = get_all_data()
+        if isinstance(data, (list, tuple)) and len(data) >= 2:
+            X, Y = data[0], data[1]
+            if torch.is_tensor(X) and torch.is_tensor(Y):
+                return TensorDataset(X.detach().cpu(), Y.detach().cpu())
 
     raise RuntimeError("Could not convert Buffer to dataset; adjust adapters to your Buffer API.")
 

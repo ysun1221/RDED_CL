@@ -15,6 +15,9 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from cl_utils.rded_adapter import RDEDDistiller
+# customized mammoth model, wires experience replay model with rded
+# at task bounds
+
 
 @staticmethod
 def _extract_label(item):
@@ -43,7 +46,8 @@ def _extract_label(item):
 
 @staticmethod
 def _infer_task_labels(ds, cap=5000):
-    """Collect a set of labels present in this task (scan up to `cap` samples)."""
+    """Infer which labels are present in dataset for the current task,
+        Collect a set of labels present in this task."""
     labels = set()
     n = len(ds) if hasattr(ds, "__len__") else cap
     n = min(n, cap)
@@ -65,12 +69,13 @@ def _infer_task_labels(ds, cap=5000):
                     pass
     return labels
 
-
+# extend er model
 class ErRDED(Er):
     NAME = "er_rded"
 
     @staticmethod
     def get_parser(parser):
+        """reuse ER argument and add rded argument"""
         parser = Er.get_parser(parser)
 
         g = parser.add_argument_group("RDED")
@@ -91,6 +96,13 @@ class ErRDED(Er):
         return parser
 
     def __init__(self, backbone, loss, args, transform, dataset=None):
+        """parameter:
+            backbone: the neural network model
+            loss: loss function
+            args: parsed cli arguments
+            transform: data augmentation/preprocess transform
+            dataset: dataset
+        """
         super().__init__(backbone, loss, args, transform, dataset=dataset)
 
         assert isinstance(self.buffer, Buffer), "ER should provide a Buffer instance."
@@ -117,7 +129,7 @@ class ErRDED(Er):
         self._bank_y: Optional[torch.Tensor] = None
 
     def _extract_indexable_train_ds(self, dataset) -> Dataset:
-        
+        """extract an indexable train dataset from the dataset object that mammoth passes into endtask"""
         if hasattr(dataset, "train_loader") and dataset.train_loader is not None:
             tl = dataset.train_loader
             if isinstance(tl, (list, tuple)):
@@ -146,6 +158,8 @@ class ErRDED(Er):
         device: torch.device,
         seed_offset: int = 0,
     ) -> torch.Tuple[torch.Tensor, torch.Tensor]:
+        """rebalance a big bank of samples (bank_x , bank_y) to fit the replay buffer
+            budget while preserving a roughly uniform perclass allocation"""
         classes: List[int] = torch.unique(bank_y).tolist()
         m_per = max(self._buf_limit // max(len(classes), 1), 1)
 
@@ -171,26 +185,123 @@ class ErRDED(Er):
 
         return new_x, new_y
 
+    def _seen_classes(self, dataset, device):
+        """Return list of class ids present in the just-seen task dataset."""
+        loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=0)
+        ys = []
+
+        with torch.no_grad():
+            for batch in loader:
+                # case 1: tuple/list (x, y) or (x, y, ...)
+                if isinstance(batch, (list, tuple)):
+                    if len(batch) >= 2:
+                        y = batch[1]
+                    else:
+                        # single element; try dict inside
+                        item = batch[0]
+                        if isinstance(item, dict):
+                            y = item.get("targets") or item.get("labels") or item.get("y")
+                        else:
+                            continue
+                # case 2: dict batch
+                elif isinstance(batch, dict):
+                    y = batch.get("targets") or batch.get("labels") or batch.get("y")
+                else:
+                    # unknown structure; skip
+                    continue
+
+                if y is None:
+                    continue
+
+                # ensure tensor on same device
+                if not torch.is_tensor(y):
+                    try:
+                        y = torch.as_tensor(y)
+                    except Exception:
+                        continue
+
+                ys.append(y.to(device))
+
+                # safety cap (avoid scanning huge datasets)
+                if sum(t.numel() for t in ys) >= 50000:
+                    break
+
+        if not ys:
+            return []
+
+        y_all = torch.cat(ys)
+        return sorted(torch.unique(y_all).tolist())
+
+    def _merge_into_buffer(self, new_x, new_y, device):
+        """Merge distilled samples with current buffer, class-balanced to buffer_size."""
+        max_n = int(self.args.buffer_size)
+
+        # current contents
+        old_x = getattr(self.buffer, "examples", None)
+        old_y = getattr(self.buffer, "labels", None)
+        if old_x is None or old_y is None or old_x.numel() == 0:
+            self.buffer.empty()
+            self.buffer.add_data(examples=new_x, labels=new_y)
+            return
+
+        X = torch.cat([old_x.to(device), new_x], dim=0)
+        Y = torch.cat([old_y.to(device), new_y], dim=0)
+
+        classes = torch.unique(Y).tolist()
+        per_class = max(1, max_n // max(1, len(classes)))
+
+        keep_idx = []
+        for c in classes:
+            idx = (Y == c).nonzero(as_tuple=True)[0]
+            if idx.numel() > per_class:
+                idx = idx[torch.randperm(idx.numel(), device=idx.device)[:per_class]]
+            keep_idx.append(idx)
+        keep_idx = torch.cat(keep_idx)
+        if keep_idx.numel() > max_n:
+            keep_idx = keep_idx[torch.randperm(keep_idx.numel(), device=keep_idx.device)[:max_n]]
+
+        X, Y = X[keep_idx], Y[keep_idx]
+
+        self.buffer.empty()
+        self.buffer.add_data(examples=X, labels=Y)
+
     def end_task(self, dataset) -> None:
+        """ At each task boundary:
+            estimate classes seen so far,
+            distill current-task data with RDED (per-class target based on seen classes),
+            merge distilled samples with existing buffer (class-balanced)."""
         device = next(self.net.parameters()).device
 
-        if hasattr(dataset, "train_loader") and getattr(dataset.train_loader, "dataset", None) is not None:
-            raw_ds = dataset.train_loader.dataset
-        elif hasattr(dataset, "train_dataloader") and getattr(dataset.train_dataloader, "dataset", None) is not None:
-            raw_ds = dataset.train_dataloader.dataset
-        elif hasattr(dataset, "train_dataset"):
-            raw_ds = dataset.train_dataset
-        else:
+        raw_ds = getattr(dataset, "train_dataset", None)
+        if raw_ds is None:
+            raw_ds = getattr(dataset, "train_loader", None)
+            raw_ds = getattr(raw_ds, "dataset", None) if raw_ds is not None else None
+        if raw_ds is None:
             raw_ds = dataset
 
-        self._rded.cfg["gather_limit"] = self._rded.cfg.get("gather_limit", None)
+        seen = self._seen_classes(raw_ds, device)
+        n_seen = max(1, len(seen))
 
-        synth_ds = self._rded.distill(raw_ds, per_class=self._rded_per_class, device=str(device))
+        per_class_target = max(
+            1,
+            min(int(self.args.buffer_size) // n_seen, int(self._rded_per_class))
+        )
+
+        synth_ds = self._rded.distill(raw_ds, per_class=per_class_target, device=str(device))
+
         xs = torch.stack([synth_ds[i][0] for i in range(len(synth_ds))], dim=0).to(device)
         ys = torch.tensor([int(synth_ds[i][1]) for i in range(len(synth_ds))], device=device)
 
-        self.buffer.empty()
-        self.buffer.add_data(examples=xs, labels=ys)
+        self._merge_into_buffer(xs, ys, device)
+
+        with torch.no_grad():
+            ex = getattr(self.buffer, "examples", None)
+            lab = getattr(self.buffer, "labels", None)
+            if ex is not None and lab is not None and lab.numel() > 0:
+                uniq = torch.unique(lab)
+                counts = {int(c): int((lab == c).sum()) for c in uniq}
+                print(f"[ErRDED] buffer size: {len(lab)} | classes: {len(counts)} "
+                    f"| per-class min/max: "
+                    f"{min(counts.values())}/{max(counts.values())}")
 
         super().end_task(dataset)
-
