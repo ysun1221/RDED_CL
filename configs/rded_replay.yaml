@@ -1,0 +1,29 @@
+agent:
+  name: RDEDReplayAgent
+  args:
+    budget_mb: 200
+    rded_cfg_from: "configs/rded_config.yaml"
+
+training:
+  epochs_per_task: 50
+  batch_size: 128
+  seed: 1
+
+scenario:
+  name: split_cifar100
+  tasks: 10
+
+backbone:
+  name: resnet18
+  args: {}
+
+optimizer:
+  name: sgd
+  args:
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 0.0
+
+logger:
+  name: basic
+  args: {}

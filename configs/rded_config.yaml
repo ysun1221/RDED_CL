@@ -1,0 +1,8 @@
+rded:
+  iters: 500
+  lr: 0.1
+  augment: true
+  seed: 1
+
+  gather_bs: 256
+  gather_workers: 0
